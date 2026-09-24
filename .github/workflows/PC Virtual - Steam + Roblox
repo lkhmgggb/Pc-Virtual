@@ -1,0 +1,430 @@
+name: PC Virtual - Steam + Roblox
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_number:
+        description: "Número da instância"
+        required: true
+        default: "1"
+        type: string
+
+jobs:
+  pc-virtual:
+    name: PC Virtual ${{ github.event.inputs.instance_number }}
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+
+      # ==========================================
+      # 1. INFORMAÇÕES DO PC
+      # ==========================================
+      - name: Informações do sistema
+        shell: powershell
+        run: |
+          Write-Host "====================================="
+          Write-Host "        PC VIRTUAL WINDOWS"
+          Write-Host "====================================="
+          Write-Host "Instance: ${{ github.event.inputs.instance_number }}"
+          Write-Host "Runner: $env:RUNNER_NAME"
+          Write-Host ""
+
+          Get-ComputerInfo |
+            Select-Object WindowsProductName,
+                          WindowsVersion,
+                          OsArchitecture
+
+          Write-Host ""
+          Write-Host "CPU:"
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores, NumberOfLogicalProcessors
+
+          Write-Host ""
+          Write-Host "RAM:"
+          Get-CimInstance Win32_ComputerSystem |
+            Select-Object @{Name="RAM_GB";Expression={
+              [math]::Round($_.TotalPhysicalMemory / 1GB, 2)
+            }}
+
+      # ==========================================
+      # 2. HABILITAR RDP
+      # ==========================================
+      - name: Ativar Remote Desktop
+        shell: powershell
+        run: |
+          Write-Host "Ativando RDP..."
+
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 1
+
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop"
+
+          Write-Host "RDP ativado."
+
+      # ==========================================
+      # 3. CONFIGURAR USUÁRIO RDP
+      # ==========================================
+      - name: Configurar usuário RDP
+        shell: powershell
+        run: |
+          $User = "runneradmin"
+          $PasswordText = "PcVirtual_2026!ChangeMe"
+
+          $Password = ConvertTo-SecureString `
+            $PasswordText `
+            -AsPlainText `
+            -Force
+
+          $ExistingUser = Get-LocalUser `
+            -Name $User `
+            -ErrorAction SilentlyContinue
+
+          if ($ExistingUser) {
+              Set-LocalUser `
+                -Name $User `
+                -Password $Password
+          }
+          else {
+              New-LocalUser `
+                -Name $User `
+                -Password $Password `
+                -FullName "PC Virtual User" `
+                -Description "Usuário do PC Virtual"
+          }
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $User `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Usuário RDP configurado."
+          Write-Host "Username: $User"
+          Write-Host "A senha NÃO será exibida no log."
+
+      # ==========================================
+      # 4. INSTALAR TAILSCALE
+      # ==========================================
+      - name: Instalar Tailscale
+        shell: powershell
+        run: |
+          $Url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $Installer = "$env:TEMP\tailscale.msi"
+
+          Write-Host "Baixando Tailscale..."
+
+          Invoke-WebRequest `
+            -Uri $Url `
+            -OutFile $Installer
+
+          Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList "/i `"$Installer`" /quiet /norestart" `
+            -Wait
+
+          Remove-Item $Installer -Force
+
+          Write-Host "Tailscale instalado."
+
+      # ==========================================
+      # 5. CONECTAR TAILSCALE
+      # ==========================================
+      - name: Conectar Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $Tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $Tailscale)) {
+              Write-Error "Tailscale não foi encontrado."
+              exit 1
+          }
+
+          $Hostname = "pc-virtual-${{ github.run_id }}"
+
+          & $Tailscale up `
+            --authkey="$env:TAILSCALE_AUTH_KEY" `
+            --hostname="$Hostname"
+
+          Start-Sleep -Seconds 10
+
+          Write-Host "Status Tailscale:"
+          & $Tailscale status
+
+      # ==========================================
+      # 6. PEGAR IP TAILSCALE
+      # ==========================================
+      - name: Obter IP Tailscale
+        shell: powershell
+        run: |
+          $Tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+
+          $IP = (& $Tailscale ip -4).Trim()
+
+          if ([string]::IsNullOrWhiteSpace($IP)) {
+              Write-Error "Não foi possível obter o IP Tailscale."
+              exit 1
+          }
+
+          "TAILSCALE_IP=$IP" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Append
+
+          Write-Host ""
+          Write-Host "====================================="
+          Write-Host "          PC VIRTUAL ONLINE"
+          Write-Host "====================================="
+          Write-Host "Tailscale IP: $IP"
+          Write-Host "RDP usuário: runneradmin"
+          Write-Host "====================================="
+
+      # ==========================================
+      # 7. INSTALAR CHROME
+      # ==========================================
+      - name: Instalar Google Chrome
+        shell: powershell
+        run: |
+          $Url = "https://dl.google.com/chrome/install/latest/chrome_installer.exe"
+          $Installer = "$env:TEMP\chrome.exe"
+
+          Invoke-WebRequest `
+            -Uri $Url `
+            -OutFile $Installer
+
+          Start-Process `
+            -FilePath $Installer `
+            -ArgumentList "/silent /install" `
+            -Wait
+
+          Remove-Item $Installer -Force
+
+          Write-Host "Chrome instalado."
+
+      # ==========================================
+      # 8. INSTALAR 7-ZIP
+      # ==========================================
+      - name: Instalar 7-Zip
+        shell: powershell
+        run: |
+          $Url = "https://www.7-zip.org/a/7z2501-x64.exe"
+          $Installer = "$env:TEMP\7zip.exe"
+
+          Invoke-WebRequest `
+            -Uri $Url `
+            -OutFile $Installer
+
+          Start-Process `
+            -FilePath $Installer `
+            -ArgumentList "/S" `
+            -Wait
+
+          Remove-Item $Installer -Force
+
+          Write-Host "7-Zip instalado."
+
+      # ==========================================
+      # 9. INSTALAR STEAM
+      # ==========================================
+      - name: Instalar Steam
+        shell: powershell
+        run: |
+          $Url = "https://cdn.cloudflare.steamstatic.com/client/installer/SteamSetup.exe"
+          $Installer = "$env:TEMP\SteamSetup.exe"
+
+          Write-Host "Baixando Steam..."
+
+          Invoke-WebRequest `
+            -Uri $Url `
+            -OutFile $Installer
+
+          Write-Host "Instalando Steam..."
+
+          Start-Process `
+            -FilePath $Installer `
+            -ArgumentList "/S" `
+            -Wait
+
+          Remove-Item $Installer -Force
+
+          Write-Host "Steam instalado."
+
+      # ==========================================
+      # 10. INSTALAR ROBLOX
+      # ==========================================
+      - name: Instalar Roblox
+        shell: powershell
+        run: |
+          $Url = "https://setup.rbxcdn.com/RobloxPlayerInstaller.exe"
+          $Installer = "$env:TEMP\RobloxPlayerInstaller.exe"
+
+          Write-Host "Baixando Roblox..."
+
+          Invoke-WebRequest `
+            -Uri $Url `
+            -OutFile $Installer
+
+          Write-Host "Instalando Roblox..."
+
+          Start-Process `
+            -FilePath $Installer `
+            -ArgumentList "-install" `
+            -Wait
+
+          Remove-Item $Installer -Force
+
+          Write-Host "Roblox instalado."
+
+      # ==========================================
+      # 11. VERIFICAR INSTALAÇÕES
+      # ==========================================
+      - name: Verificar programas
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "====================================="
+          Write-Host "       PROGRAMAS INSTALADOS"
+          Write-Host "====================================="
+
+          $SteamPaths = @(
+            "C:\Program Files (x86)\Steam\steam.exe",
+            "C:\Program Files\Steam\steam.exe"
+          )
+
+          foreach ($Path in $SteamPaths) {
+              if (Test-Path $Path) {
+                  Write-Host "Steam: OK"
+              }
+          }
+
+          $RobloxPaths = @(
+            "$env:LOCALAPPDATA\Roblox",
+            "C:\Program Files (x86)\Roblox"
+          )
+
+          $RobloxFound = $false
+
+          foreach ($Path in $RobloxPaths) {
+              if (Test-Path $Path) {
+                  $RobloxFound = $true
+              }
+          }
+
+          if ($RobloxFound) {
+              Write-Host "Roblox: OK"
+          }
+          else {
+              Write-Host "Roblox: instalação não confirmada"
+          }
+
+          if (Test-Path "C:\Program Files\Google\Chrome\Application\chrome.exe") {
+              Write-Host "Chrome: OK"
+          }
+
+      # ==========================================
+      # 12. TESTAR RDP
+      # ==========================================
+      - name: Verificar RDP
+        shell: powershell
+        run: |
+          $RDP = Get-Service -Name TermService
+
+          Write-Host "RDP Service: $($RDP.Status)"
+
+          if ($RDP.Status -ne "Running") {
+              Start-Service TermService
+          }
+
+          $Port = Get-NetTCPConnection `
+            -LocalPort 3389 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if ($Port) {
+              Write-Host "RDP porta 3389: LISTENING"
+          }
+          else {
+              Write-Host "RDP porta 3389: não detectada"
+          }
+
+      # ==========================================
+      # 13. INFORMAÇÕES FINAIS
+      # ==========================================
+      - name: Dados de conexão
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════╗"
+          Write-Host "║          PC VIRTUAL ONLINE           ║"
+          Write-Host "╠══════════════════════════════════════╣"
+          Write-Host "║ IP Tailscale: $env:TAILSCALE_IP"
+          Write-Host "║ Usuário: runneradmin"
+          Write-Host "║ Porta RDP: 3389"
+          Write-Host "║ Steam: instalado"
+          Write-Host "║ Roblox: instalado"
+          Write-Host "╚══════════════════════════════════════╝"
+          Write-Host ""
+          Write-Host "Conecte seu dispositivo à mesma rede Tailscale."
+          Write-Host "Depois abra um cliente Microsoft Remote Desktop."
+          Write-Host ""
+          Write-Host "O PC ficará disponível enquanto este workflow estiver executando."
+
+      # ==========================================
+      # 14. MANTER PC LIGADO
+      # ==========================================
+      - name: Manter PC Virtual ativo
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $Tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+
+          $Counter = 0
+
+          Write-Host ""
+          Write-Host "====================================="
+          Write-Host "       SESSÃO PC VIRTUAL ATIVA"
+          Write-Host "====================================="
+
+          while ($true) {
+
+              $Counter++
+
+              Write-Host ""
+              Write-Host "Heartbeat #$Counter - $(Get-Date)"
+
+              $Status = & $Tailscale status 2>&1
+
+              if ($LASTEXITCODE -eq 0) {
+                  Write-Host "Tailscale: ONLINE"
+              }
+              else {
+                  Write-Host "Tailscale desconectado. Reconectando..."
+
+                  & $Tailscale up `
+                    --authkey="$env:TAILSCALE_AUTH_KEY" `
+                    --hostname="pc-virtual-${{ github.run_id }}"
+              }
+
+              $RDPService = Get-Service `
+                -Name TermService `
+                -ErrorAction SilentlyContinue
+
+              if ($RDPService.Status -ne "Running") {
+                  Start-Service TermService
+                  Write-Host "RDP reiniciado."
+              }
+              else {
+                  Write-Host "RDP: ONLINE"
+              }
+
+              Start-Sleep -Seconds 60
+          }
